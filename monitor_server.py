@@ -73,15 +73,16 @@ def print_rich_table(latest_entry=None):
               f"最终回显:{latest_entry['final_effort']}{alert}")
         return
 
-    table = Table(title="🔍 AI 出口模型与思考等级监控 (Model & Reasoning Monitor)", show_header=True, header_style="bold cyan")
+    table = Table(title="🔍 AI 出口思考等级监控 (AI Reasoning Monitor)", show_header=True, header_style="bold cyan")
     table.add_column("时间", width=10, style="dim")
-    table.add_column("来源工具", width=14, style="bold")
-    table.add_column("模型", width=18, style="magenta")
-    table.add_column("请求", width=10, justify="center")
-    table.add_column("创建回显", width=10, justify="center")
-    table.add_column("最终回显", width=10, justify="center")
-    table.add_column("思考Tokens", width=12, justify="right")
-    table.add_column("状态判定", width=16)
+    table.add_column("来源工具", width=13, style="bold")
+    table.add_column("模型", width=17, style="magenta")
+    table.add_column("请求", width=8, justify="center")
+    table.add_column("首包回显", width=9, justify="center")
+    table.add_column("最终回显", width=9, justify="center")
+    table.add_column("思考Tokens", width=11, justify="right")
+    table.add_column("预测等级", width=9, justify="center")
+    table.add_column("状态判定", width=14)
 
     # Show last 10 entries in terminal
     with LOGS_LOCK:
@@ -89,15 +90,15 @@ def print_rich_table(latest_entry=None):
 
     for item in reversed(display_items):
         is_alert = item.get("is_downgraded")
-        status_text = Text("⚠️ " + item.get("alert_reason", "降级"), style="bold red") if is_alert else Text("✓ 一致", style="green")
+        status_text = Text("⚠️ " + item.get("alert_reason", "降级"), style="bold red") if is_alert else Text("✓ 匹配", style="green")
 
         def color_effort(lvl):
             if not lvl or lvl == "-": return Text("-", style="dim")
             lvl_str = str(lvl)
-            if "xhigh" in lvl_str: return Text(lvl_str, style="bold orange1")
-            if "high" in lvl_str: return Text(lvl_str, style="bold yellow")
-            if "medium" in lvl_str: return Text(lvl_str, style="yellow3")
-            if "low" in lvl_str: return Text(lvl_str, style="cyan")
+            if "xhigh" in lvl_str.lower() or "max" in lvl_str.lower(): return Text(lvl_str, style="bold orange1")
+            if "high" in lvl_str.lower(): return Text(lvl_str, style="bold yellow")
+            if "medium" in lvl_str.lower(): return Text(lvl_str, style="yellow3")
+            if "low" in lvl_str.lower(): return Text(lvl_str, style="cyan")
             return Text(lvl_str, style="white")
 
         table.add_row(
@@ -108,6 +109,7 @@ def print_rich_table(latest_entry=None):
             color_effort(item["create_effort"]),
             color_effort(item["final_effort"]),
             f"{item['reasoning_tokens']} tok" if item.get('reasoning_tokens') else "-",
+            color_effort(item.get("predicted_effort", "-")),
             status_text
         )
 
@@ -164,6 +166,28 @@ def normalize_effort_score(effort_val, tokens=0):
         return 1
 
     return 0
+
+def estimate_predicted_effort(tokens):
+    """
+    基于 Artificial Analysis Intelligence Index v4.3 权威测试基准根据 Token 消耗估算推理档位：
+    - Low:    约 938 tok  (范围: 0 < tokens < 2000)
+    - Medium: 约 3k tok   (范围: 2000 <= tokens < 4000)
+    - High:   约 5k tok   (范围: 4000 <= tokens < 7000)
+    - XHigh:  约 9k tok   (范围: 7000 <= tokens < 13000)
+    - Max:    约 17k+ tok (范围: tokens >= 13000)
+    """
+    if not tokens or tokens <= 0:
+        return "-"
+    if tokens >= 13000:
+        return "Max"
+    elif tokens >= 7000:
+        return "XHigh"
+    elif tokens >= 4000:
+        return "High"
+    elif tokens >= 2000:
+        return "Medium"
+    else:
+        return "Low"
 
 
 def parse_request_payload(body_bytes, path):
@@ -621,6 +645,7 @@ class MonitorProxyHandler(BaseHTTPRequestHandler):
             "create_effort": create_effort,
             "final_effort": final_effort,
             "reasoning_tokens": reasoning_tokens,
+            "predicted_effort": estimate_predicted_effort(reasoning_tokens),
             "path": self.path,
             "upstream": upstream_base,
             "duration_ms": duration_ms,

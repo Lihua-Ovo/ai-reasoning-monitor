@@ -20,8 +20,9 @@
 
 1. **提取请求等级**：捕获客户端发出的思考强度参数（如 `reasoning_effort: xhigh/high` 或 thinking budget）。
 2. **抓取返回回显**：从服务端流式首包（Chunk 0）和尾包/Usage 中提取实际生效的思考参数与 `reasoning_tokens`。
-3. **判定降级告警**：比对两者，若服务端返回的推理强度低于请求等级，在 Web 控制台和终端立即红字告警。
-4. **协同守护**：当 cc-switch 切换服务时，自动维护 Codex 端口映射，无需手动反复修改配置。
+3. **权威跑分预测档位**：基于 Artificial Analysis Intelligence Index 公开评测基准，结合实际推理 Token 消耗科学预估“预测等级”（Low/Medium/High/XHigh/Max）。
+4. **判定降级告警**：比对两者，若服务端返回的推理强度低于请求等级，在 Web 控制台和终端立即红字告警。
+5. **协同守护**：当 cc-switch 切换服务时，自动维护 Codex 端口映射，无需手动反复修改配置。
 
 ---
 
