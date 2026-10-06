@@ -18,20 +18,64 @@ import queue
 import threading
 import sqlite3
 import re
+import subprocess
 from datetime import datetime
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 import requests
 
+# Windows 终端控制台环境安全初始化：强制切换 UTF-8 代码页并启用虚拟终端 (VT100)
+# 彻底防止双击 exe 时因 Windows 默认 GBK 编码无法输出特殊符号导致 UnicodeEncodeError 闪退
+if sys.platform == "win32":
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        kernel32.SetConsoleOutputCP(65001)
+        kernel32.SetConsoleCP(65001)
+        STD_OUTPUT_HANDLE = -11
+        h_out = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+        mode = ctypes.c_ulong()
+        if kernel32.GetConsoleMode(h_out, ctypes.byref(mode)):
+            ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+            kernel32.SetConsoleMode(h_out, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+    except Exception:
+        pass
+
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 try:
     from rich.console import Console
     from rich.table import Table
     from rich.text import Text
-    console = Console()
+    console = Console(safe_box=True)
     HAS_RICH = True
 except ImportError:
     HAS_RICH = False
     console = None
+
+def free_port(port):
+    """自动释放被旧监控器进程占用的端口，防止 WinError 10048 闪退"""
+    if sys.platform != "win32":
+        return
+    try:
+        my_pid = os.getpid()
+        res = subprocess.run(["netstat", "-ano", "-p", "tcp"], capture_output=True, text=True, errors="ignore")
+        for line in res.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 5 and parts[3] == "LISTENING":
+                if parts[1].endswith(f":{port}"):
+                    target_pid = int(parts[4])
+                    if target_pid != my_pid and target_pid != 0:
+                        subprocess.run(["taskkill", "/F", "/PID", str(target_pid)], capture_output=True)
+        time.sleep(0.5)
+    except Exception:
+        pass
 
 # 路径常量 (cc-switch 与各客户端配置文件)
 CC_SWITCH_SETTINGS = os.path.expanduser(r"~\.cc-switch\settings.json")
@@ -147,13 +191,13 @@ def add_log_entry(entry):
 
 def print_rich_table(latest_entry=None):
     if not HAS_RICH:
-        alert = f" [⚠️ {latest_entry.get('alert_reason')}]" if latest_entry.get("is_downgraded") else " [OK]"
+        alert = f" [! {latest_entry.get('alert_reason')}]" if latest_entry.get("is_downgraded") else " [OK]"
         print(f"[{latest_entry['time']}] {latest_entry['tool']} | 模型:{latest_entry['model']} | "
               f"请求:{latest_entry['req_effort']} | 创建回显:{latest_entry['create_effort']} | "
               f"最终回显:{latest_entry['final_effort']}{alert}")
         return
 
-    table = Table(title="🔍 AI 出口思考等级监控 (AI Reasoning Monitor)", show_header=True, header_style="bold cyan")
+    table = Table(title="[监控] AI 出口思考等级监控 (AI Reasoning Monitor)", show_header=True, header_style="bold cyan")
     table.add_column("时间", width=10, style="dim")
     table.add_column("来源工具", width=13, style="bold")
     table.add_column("模型", width=17, style="magenta")
@@ -169,7 +213,7 @@ def print_rich_table(latest_entry=None):
 
     for item in reversed(display_items):
         is_alert = item.get("is_downgraded")
-        status_text = Text("⚠️ " + item.get("alert_reason", "降级"), style="bold red") if is_alert else Text("✓ 匹配", style="green")
+        status_text = Text("[!] " + item.get("alert_reason", "降级"), style="bold red") if is_alert else Text("[OK] 匹配", style="green")
 
         def color_effort(lvl):
             if not lvl or lvl == "-": return Text("-", style="dim")
@@ -858,7 +902,7 @@ def start_config_auto_sync():
                         new_content = content.replace("127.0.0.1:15721/v1", "127.0.0.1:5050/v1")
                         with open(codex_toml, "w", encoding="utf-8") as f:
                             f.write(new_content)
-                        msg = "⚡ 自动守护生效：检测到 cc-switch 切换了 Codex 配置，已自动重定向至 5050 监控器！"
+                        msg = "[*] 自动守护生效：检测到 cc-switch 切换了 Codex 配置，已自动重定向至 5050 监控器！"
                         if HAS_RICH and console:
                             console.print(f"[bold cyan]{msg}[/bold cyan]")
                         else:
@@ -880,7 +924,7 @@ def start_config_auto_sync():
 
                         # 强制刷新缓存，获取当前供应商名称
                         prov_name, _, _ = get_ccswitch_provider_info("ClaudeDesktop", force_refresh=True)
-                        msg = f"⚡ 自动守护生效：检测到 cc-switch 切换了 Claude Desktop 供应商 -> [{prov_name}] ({new_real_upstream})，已自动对接 5050 监控器！"
+                        msg = f"[*] 自动守护生效：检测到 cc-switch 切换了 Claude Desktop 供应商 -> [{prov_name}] ({new_real_upstream})，已自动对接 5050 监控器！"
                         if HAS_RICH and console:
                             console.print(f"[bold cyan]{msg}[/bold cyan]")
                         else:
@@ -899,18 +943,32 @@ class ThreadedHTTPServer(ThreadingHTTPServer):
 
 def run_server(port=5050):
     start_config_auto_sync()
-    server = ThreadedHTTPServer(("0.0.0.0", port), MonitorProxyHandler)
+
+    try:
+        server = ThreadedHTTPServer(("0.0.0.0", port), MonitorProxyHandler)
+    except OSError as e:
+        if getattr(e, "winerror", None) == 10048 or "10048" in str(e):
+            msg = f"[!] 检测到端口 {port} 已被占用，正在自动释放旧进程并重试..."
+            if HAS_RICH and console:
+                console.print(f"[yellow]{msg}[/yellow]")
+            else:
+                print(msg)
+            free_port(port)
+            server = ThreadedHTTPServer(("0.0.0.0", port), MonitorProxyHandler)
+        else:
+            raise
+
     cd_name, cd_url, _ = get_ccswitch_provider_info("ClaudeDesktop")
     codex_name, codex_url, _ = get_ccswitch_provider_info("Codex")
 
     if HAS_RICH:
-        console.print(f"[bold green]✓ AI 模型与思考等级监控服务已启动！[/bold green]")
-        console.print(f"[cyan]• Web 仪表盘:[/cyan] [bold underline]http://127.0.0.1:{port}[/bold underline]")
-        console.print(f"[cyan]• 代理监听端口:[/cyan] [bold]127.0.0.1:{port}[/bold]")
-        console.print(f"[cyan]• 全自动守护状态:[/cyan] [bold green]Codex (已接管)[/bold green] | [bold green]Claude Desktop (已接管)[/bold green]")
-        console.print(f"[dim]• 动态上游解析: Codex -> 127.0.0.1:15721 [{codex_name}], Claude Desktop -> {cd_url or '默认'} [{cd_name}][/dim]\n")
+        console.print(f"[bold green][OK] AI 模型与思考等级监控服务已启动！[/bold green]")
+        console.print(f"[cyan]- Web 仪表盘:[/cyan] [bold underline]http://127.0.0.1:{port}[/bold underline]")
+        console.print(f"[cyan]- 代理监听端口:[/cyan] [bold]127.0.0.1:{port}[/bold]")
+        console.print(f"[cyan]- 全自动守护状态:[/cyan] [bold green]Codex (已接管)[/bold green] | [bold green]Claude Desktop (已接管)[/bold green]")
+        console.print(f"[dim]- 动态上游解析: Codex -> 127.0.0.1:15721 [{codex_name}], Claude Desktop -> {cd_url or '默认'} [{cd_name}][/dim]\n")
     else:
-        print(f"Server started on http://127.0.0.1:{port}")
+        print(f"[OK] Server started on http://127.0.0.1:{port}")
         print(f"Auto-sync active: Codex & Claude Desktop -> 127.0.0.1:{port}")
 
     print_rich_table()
@@ -923,6 +981,17 @@ def run_server(port=5050):
 
 
 if __name__ == "__main__":
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 5050
-    run_server(port)
+    try:
+        port = int(sys.argv[1]) if len(sys.argv) > 1 else 5050
+        run_server(port)
+    except Exception as e:
+        import traceback
+        print("\n" + "=" * 60)
+        print("服务启动发生未捕获异常:")
+        traceback.print_exc()
+        print("=" * 60)
+        try:
+            input("\n按回车键退出程序 (Press Enter to exit)...")
+        except Exception:
+            pass
 
