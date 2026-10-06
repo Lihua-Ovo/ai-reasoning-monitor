@@ -128,12 +128,12 @@ def detect_tool_name(headers, path, body):
         return "Cursor"
 def normalize_effort_score(effort_val, tokens=0):
     """
-    将任意思考参数归一化为 0~5 档量化分值，精准判定 5 档思考降级:
-    5档: xhigh, max, extreme, budget >= 24000, "5"
-    4档: high, deep, budget >= 8000, "4"
-    3档: medium, med, balanced, budget >= 2000, "3"
-    2档: low, minimal, min, budget >= 500, "2"
-    1档: very-low, lowest, budget > 0, "1"
+    量化评分对齐 5 档思考等级（完全基于服务端真实返回参数，不基于 Token 数量脑补）：
+    5档: xhigh, max, extreme, ultra, "5"
+    4档: high, deep, "4"
+    3档: medium, med, balanced, "3"
+    2档: low, "2"
+    1档: minimal, min, very-low, lowest, "1"
     0档: none, off, disabled, "0", "-"
     """
     if effort_val is None:
@@ -141,39 +141,27 @@ def normalize_effort_score(effort_val, tokens=0):
     s = str(effort_val).lower().strip()
     if not s or s in ["-", "none", "off", "disabled", "false", "0"]:
         return 0
-    if s in ["5", "xhigh", "max", "extreme", "extra-high", "extra_high"]:
+    if s in ["5", "xhigh", "max", "extreme", "extra-high", "extra_high", "ultra"]:
         return 5
     if s in ["4", "high", "deep"]:
         return 4
     if s in ["3", "medium", "med", "balanced"]:
         return 3
-    if s in ["2", "low", "minimal", "min"]:
+    if s in ["2", "low"]:
         return 2
-    if s in ["1", "very-low", "lowest"]:
+    if s in ["1", "minimal", "min", "very-low", "lowest"]:
         return 1
 
-    import re
-    m = re.search(r"\b(\d+)\b", s)
-    val = int(m.group(1)) if m else (tokens or 0)
-    if val >= 24000:
-        return 5
-    elif val >= 8000:
-        return 4
-    elif val >= 2000:
-        return 3
-    elif val >= 500:
-        return 2
-    elif val > 0:
-        return 1
-
-    if "xhigh" in s or "max" in s or "extreme" in s:
+    if "xhigh" in s or "max" in s or "extreme" in s or "ultra" in s:
         return 5
     if "high" in s or "deep" in s:
         return 4
     if "medium" in s or "med" in s or "balanced" in s:
         return 3
-    if "low" in s or "min" in s:
+    if "low" in s:
         return 2
+    if "min" in s:
+        return 1
 
     return 0
 
@@ -593,37 +581,29 @@ class MonitorProxyHandler(BaseHTTPRequestHandler):
             self.wfile.write(err_msg)
             return
 
-        # Fallback values if not set by upstream chunk
-        if create_effort == "-":
-            create_effort = req_effort
-        if final_effort == "-":
-            if reasoning_tokens > 0:
-                if reasoning_tokens >= 24000: final_effort = "xhigh"
-                elif reasoning_tokens >= 8000: final_effort = "high"
-                elif reasoning_tokens >= 2000: final_effort = "medium"
-                elif reasoning_tokens >= 500: final_effort = "low"
-                else: final_effort = "minimal"
-            else:
-                final_effort = create_effort
-
-        # Downgrade / Mismatch detection (支持 5 档思考等级细粒度比对)
+        # 实事求是：服务端未返回思考等级字段时，忠实保留为 "-" (空)，绝不根据 Token 数量臆测 minimal
         duration_ms = int((time.time() - start_time) * 1000)
         is_downgraded = False
         alert_reasons = []
 
-        # 1. 0~5 档量化阶梯精准比对
+        # 降级判定：仅在服务端明确返回了更低的思考等级，或请求思考但 0 token 思考失效时判定
         req_score = normalize_effort_score(req_effort)
-        create_score = normalize_effort_score(create_effort)
-        final_score = normalize_effort_score(final_effort, tokens=reasoning_tokens)
+        create_score = normalize_effort_score(create_effort) if create_effort != "-" else req_score
+        final_score = normalize_effort_score(final_effort) if final_effort != "-" else create_score
 
-        # 只要请求了思考，且服务端最终回显或首包出现降级（例如 5档降至4/3/2/1/0，或4档降至3/2/1/0）：
         if req_score > 0:
-            if final_score < req_score:
-                is_downgraded = True
-                alert_reasons.append(f"思考等级降级 ({req_effort} -> {final_effort})")
-            elif create_score < req_score and final_score <= create_score:
+            # 1. 首包明确回显了更低等级
+            if create_effort != "-" and create_score < req_score:
                 is_downgraded = True
                 alert_reasons.append(f"首包回显降级 ({req_effort} -> {create_effort})")
+            # 2. 尾包明确回显了更低等级
+            elif final_effort != "-" and final_score < req_score:
+                is_downgraded = True
+                alert_reasons.append(f"最终回显降级 ({req_effort} -> {final_effort})")
+            # 3. 请求了思考，但最终未产生任何思考 Token 且无回显确认（思考被剥夺）
+            elif reasoning_tokens == 0 and create_effort in ["-", "none", "off", "0"] and final_effort in ["-", "none", "off", "0"]:
+                is_downgraded = True
+                alert_reasons.append(f"未产生思考Token ({req_effort} 思考失效)")
 
         # 2. Check model substitution (e.g. requested gpt-6-astra or sonnet-3-7, got 4o-mini)
         if model_req != "-" and resp_model != "-" and model_req.lower() not in resp_model.lower():

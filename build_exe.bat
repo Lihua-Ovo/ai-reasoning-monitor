@@ -8,6 +8,8 @@ echo ================================================================
 echo [1/3] Installing PyInstaller if missing...
 python -m pip install pyinstaller
 
+taskkill /F /IM ModelMonitor.exe >nul 2>&1
+
 echo.
 echo [2/3] Compiling ModelMonitor.exe with embedded web UI...
 python -m PyInstaller --onefile --clean --name "ModelMonitor" --add-data "web_ui.html;." monitor_server.py
