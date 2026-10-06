@@ -1283,10 +1283,18 @@
         ? `<span class="status-capsule-badge alert">降级: ${item.alert_reason || '异常'}</span>` 
         : `<span class="status-capsule-badge ok">✓ 正常匹配</span>`;
 
-      const clientDotClass = (item.tool && item.tool.includes('Codex')) ? 'codex' : ((item.tool && item.tool.includes('Claude')) ? 'claude' : '');
-      const thinkingCell = item.reasoning_tokens
-        ? item.reasoning_tokens.toLocaleString() + ' tok'
-        : (item.thinking_chars ? item.thinking_chars.toLocaleString() + ' 字' : '-');
+      const clientDotClass = (item.tool && item.tool.toLowerCase().includes('codex')) ? 'codex' : ((item.tool && item.tool.toLowerCase().includes('claude')) ? 'claude' : '');
+      let thinkingCell = '-';
+      if (item.reasoning_tokens > 0) {
+        thinkingCell = item.reasoning_tokens.toLocaleString() + ' tok';
+        if (item.thinking_chars > 0) {
+          thinkingCell += ` <span style="font-size:10px; opacity:0.75;">(${item.thinking_chars.toLocaleString()}字)</span>`;
+        }
+      } else if (item.thinking_chars > 0) {
+        thinkingCell = item.thinking_chars.toLocaleString() + ' 字';
+      } else if (item.output_tokens > 0) {
+        thinkingCell = `<span style="opacity:0.8;">${item.output_tokens.toLocaleString()} tok <span style="font-size:10px; opacity:0.7;">(输出)</span></span>`;
+      }
 
       return `
         <tr ${rowClass} onclick="showDetail(${item.id})">
@@ -1351,7 +1359,11 @@
         </div>
         <div class="meta-row">
           <span class="k">思考消耗 (本次)</span>
-          <span class="v">${item.reasoning_tokens ? item.reasoning_tokens.toLocaleString() + ' tok (usage)' : (item.thinking_chars ? item.thinking_chars.toLocaleString() + ' 字 (thinking_delta 累计)' : '未采集到')}</span>
+          <span class="v">${item.reasoning_tokens ? item.reasoning_tokens.toLocaleString() + ' tok (usage)' : (item.thinking_chars ? item.thinking_chars.toLocaleString() + ' 字 (累计)' : '无独立思考')}</span>
+        </div>
+        <div class="meta-row">
+          <span class="k">Tokens 统计</span>
+          <span class="v">${(item.output_tokens || item.input_tokens) ? `输入: ${item.input_tokens || 0} tok · 输出: ${item.output_tokens || 0} tok` : (item.reasoning_tokens ? `${item.reasoning_tokens} tok` : '未采集到')}</span>
         </div>
         <div class="meta-row">
           <span class="k">思考等级判定</span>

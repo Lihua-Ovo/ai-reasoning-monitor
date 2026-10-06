@@ -224,6 +224,14 @@ def print_rich_table(latest_entry=None):
             if "low" in lvl_str.lower(): return Text(lvl_str, style="cyan")
             return Text(lvl_str, style="white")
 
+        tok_str = "-"
+        if item.get("reasoning_tokens"):
+            tok_str = f"{item['reasoning_tokens']} tok"
+        elif item.get("thinking_chars"):
+            tok_str = f"{item['thinking_chars']} 字"
+        elif item.get("output_tokens"):
+            tok_str = f"{item['output_tokens']} tok"
+
         table.add_row(
             item["time"],
             item["tool"],
@@ -231,7 +239,7 @@ def print_rich_table(latest_entry=None):
             color_effort(item["req_effort"]),
             color_effort(item["create_effort"]),
             color_effort(item["final_effort"]),
-            f"{item['reasoning_tokens']} tok" if item.get('reasoning_tokens') else "-",
+            tok_str,
             status_text
         )
 
@@ -263,18 +271,30 @@ def print_rich_table(latest_entry=None):
 
 def detect_tool_name(headers, path, body):
     ua = headers.get("User-Agent", "").lower()
-    if "desktop" in ua or "claude.exe" in ua or "claude-3p" in ua:
-        return "Claude Desktop"
-    if "claude-code" in ua:
+    path_lower = path.lower()
+
+    # 1. Codex 识别（最高优先级：/responses 专有路径或明确的 Codex/Copilot/OpenAI UA 特征）
+    if "/responses" in path_lower or "codex" in ua or "copilot" in ua or "openai" in ua:
+        return "Codex"
+
+    # 2. Claude Code 命令行客户端
+    if "claude-code" in ua or "claudecode" in ua:
         return "Claude Code"
+
+    # 3. Claude Desktop 客户端（必须包含 claude 相关的特征与 desktop/exe/3p，不能单凭 desktop 误判）
+    if ("claude" in ua and "desktop" in ua) or "claude.exe" in ua or "claude-3p" in ua:
+        return "Claude Desktop"
+
+    # 4. Antigravity IDE
     if "antigravity" in ua or "gemini" in ua or "google" in ua:
         return "Antigravity IDE"
-    if "codex" in ua or "copilot" in ua or "openai" in ua or "/responses" in path:
-        return "Codex"
+
+    # 5. Cursor
     if "cursor" in ua:
         return "Cursor"
-    if "/messages" in path:
-        # 检测请求特征或模型（例如 Claude Desktop 客户端特征）
+
+    # 6. /messages 路径判断（Anthropic 协议）
+    if "/messages" in path_lower:
         if isinstance(body, dict):
             m = str(body.get("model", "")).lower()
             sys_prompt = str(body.get("system", ""))
@@ -283,6 +303,7 @@ def detect_tool_name(headers, path, body):
         if "code" in ua:
             return "Claude Code"
         return "Claude Desktop"
+
     return "AI-Client"
 def normalize_effort_score(effort_val):
     """
@@ -604,9 +625,12 @@ class MonitorProxyHandler(BaseHTTPRequestHandler):
         if custom_upstream:
             return custom_upstream.rstrip("/")
 
-        # 2. Tool-based / Path-based dynamic resolution
+        # 2. Codex / responses wire API 必须路由至 127.0.0.1:15721 (cc-switch 本地代理，负责将 PROXY_MANAGED 换取真实 API Key)
+        if tool_name == "Codex" or "/responses" in path:
+            return DEFAULT_UPSTREAMS["openai"]
+
+        # 3. Claude Desktop：读取 cc-switch 当前激活供应商的真实远端地址
         if tool_name == "Claude Desktop" or ("/messages" in path and "codex" not in tool_name.lower()):
-            # 自动读取 cc-switch 中 Claude Desktop 当前激活的真实供应商
             p_name, base_url, _ = get_ccswitch_provider_info("ClaudeDesktop")
             if base_url:
                 return base_url
@@ -641,6 +665,10 @@ class MonitorProxyHandler(BaseHTTPRequestHandler):
         parsed_target = urlparse(target_url)
         headers["Host"] = parsed_target.netloc
 
+        # 对于 Codex，确保附带 Bearer PROXY_MANAGED 鉴权头以供 cc-switch 识别
+        if tool_name == "Codex" and not headers.get("authorization"):
+            headers["authorization"] = "Bearer PROXY_MANAGED"
+
         # 对于 Claude Desktop，如果请求未带鉴权头，自动补全 cc-switch 当前供应商的 API Key
         if tool_name == "Claude Desktop" and not headers.get("x-api-key") and not headers.get("authorization"):
             _, _, p_token = get_ccswitch_provider_info("ClaudeDesktop")
@@ -651,6 +679,8 @@ class MonitorProxyHandler(BaseHTTPRequestHandler):
         final_effort = "-"
         reasoning_tokens = 0
         thinking_chars = 0
+        output_tokens = 0
+        input_tokens = 0
         create_echo_raw = {}
         final_echo_raw = {}
         first_chunk_inspected = False
@@ -720,13 +750,16 @@ class MonitorProxyHandler(BaseHTTPRequestHandler):
                                 except Exception:
                                     continue
 
-                                # Support responses wire API structure
+                                # Support responses wire API structure (Codex)
                                 if "response" in chunk_json and isinstance(chunk_json["response"], dict):
                                     resp_obj = chunk_json["response"]
                                     if "model" in resp_obj:
                                         resp_model = resp_obj["model"]
                                     if "reasoning" in resp_obj and isinstance(resp_obj["reasoning"], dict):
-                                        create_effort = str(resp_obj["reasoning"].get("effort") or "enabled")
+                                        r_eff = str(resp_obj["reasoning"].get("effort") or "enabled")
+                                        if not first_chunk_inspected:
+                                            create_effort = r_eff
+                                        final_effort = r_eff
                                     if "usage" in resp_obj:
                                         chunk_json["usage"] = resp_obj["usage"]
 
@@ -751,30 +784,54 @@ class MonitorProxyHandler(BaseHTTPRequestHandler):
                                         if "model" in msg: resp_model = msg["model"]
                                         if msg.get("thinking"):
                                             create_effort = "thinking-on"
+                                        u = msg.get("usage", {})
+                                        if "input_tokens" in u:
+                                            input_tokens = u["input_tokens"]
+                                        if "output_tokens" in u and not output_tokens:
+                                            output_tokens = u["output_tokens"]
+
+                                # Anthropic content_block_start
+                                if chunk_json.get("type") == "content_block_start":
+                                    cb = chunk_json.get("content_block", {})
+                                    if isinstance(cb, dict) and cb.get("type") == "thinking":
+                                        if create_effort == "-":
+                                            create_effort = "thinking-on"
 
                                 # Anthropic 流式思考内容累计：thinking_delta 字符数（统计实际思考量）
                                 if chunk_json.get("type") == "content_block_delta":
                                     delta_obj = chunk_json.get("delta", {})
-                                    if isinstance(delta_obj, dict) and delta_obj.get("type") == "thinking_delta":
-                                        thinking_chars += len(delta_obj.get("thinking") or "")
+                                    if isinstance(delta_obj, dict):
+                                        if delta_obj.get("type") == "thinking_delta":
+                                            thinking_chars += len(delta_obj.get("thinking") or "")
+                                        elif "thinking" in delta_obj:
+                                            thinking_chars += len(delta_obj.get("thinking") or "")
+
+                                # OpenAI 流式思考内容累计 (reasoning_content)
+                                if "choices" in chunk_json and len(chunk_json["choices"]) > 0:
+                                    delta = chunk_json["choices"][0].get("delta", {})
+                                    if "reasoning_content" in delta and delta["reasoning_content"]:
+                                        thinking_chars += len(delta["reasoning_content"])
 
                                 # 2. Last / Usage chunk (最终回显)
-                                if "usage" in chunk_json:
+                                u = chunk_json.get("usage") or chunk_json.get("delta", {}).get("usage") or chunk_json.get("message", {}).get("usage")
+                                if u and isinstance(u, dict):
                                     final_echo_raw = chunk_json
-                                    usage = chunk_json["usage"]
-                                    if "completion_tokens_details" in usage:
-                                        dtls = usage["completion_tokens_details"]
-                                        rtoks = dtls.get("reasoning_tokens", 0)
-                                        if rtoks: reasoning_tokens = rtoks
-                                    elif "output_tokens_details" in usage:
-                                        dtls = usage["output_tokens_details"]
-                                        rtoks = dtls.get("reasoning_tokens", 0)
-                                        if rtoks: reasoning_tokens = rtoks
-                                    elif "thinking_tokens" in usage:
-                                        reasoning_tokens = usage["thinking_tokens"]
-                                    
-                                    if "reasoning_effort" in chunk_json:
-                                        final_effort = str(chunk_json["reasoning_effort"])
+                                    if "output_tokens" in u:
+                                        output_tokens = u["output_tokens"]
+                                    if "completion_tokens" in u and not output_tokens:
+                                        output_tokens = u["completion_tokens"]
+                                    if "input_tokens" in u:
+                                        input_tokens = u["input_tokens"]
+                                    if "prompt_tokens" in u and not input_tokens:
+                                        input_tokens = u["prompt_tokens"]
+
+                                    dtls = u.get("completion_tokens_details") or u.get("output_tokens_details") or {}
+                                    rtoks = dtls.get("reasoning_tokens", 0) or dtls.get("thinking_tokens", 0) or u.get("thinking_tokens", 0) or u.get("reasoning_tokens", 0)
+                                    if rtoks:
+                                        reasoning_tokens = rtoks
+
+                                if "reasoning_effort" in chunk_json:
+                                    final_effort = str(chunk_json["reasoning_effort"])
 
                                 # Gemini 流式: usageMetadata.thoughtsTokenCount
                                 if "usageMetadata" in chunk_json:
@@ -782,12 +839,20 @@ class MonitorProxyHandler(BaseHTTPRequestHandler):
                                     g_toks = chunk_json["usageMetadata"].get("thoughtsTokenCount") or 0
                                     if g_toks:
                                         reasoning_tokens = g_toks
+                                    if "candidatesTokenCount" in chunk_json["usageMetadata"] and not output_tokens:
+                                        output_tokens = chunk_json["usageMetadata"]["candidatesTokenCount"]
+                                    if "promptTokenCount" in chunk_json["usageMetadata"] and not input_tokens:
+                                        input_tokens = chunk_json["usageMetadata"]["promptTokenCount"]
 
                                 if "model" in chunk_json:
                                     resp_model = chunk_json["model"]
 
                     except Exception:
                         pass
+
+                # Fallback: 若 API 未返回独立 reasoning_tokens，但流式捕获到了 thinking 字符，估算 tokens
+                if reasoning_tokens == 0 and thinking_chars > 0:
+                    reasoning_tokens = max(1, round(thinking_chars / 3.5))
             else:
                 # Non-streaming response: read full body first to provide accurate Content-Length
                 full_body = resp.content
@@ -808,24 +873,47 @@ class MonitorProxyHandler(BaseHTTPRequestHandler):
                     resp_json = json.loads(full_body.decode("utf-8", errors="ignore"))
                     create_echo_raw = resp_json
                     final_echo_raw = resp_json
+
+                    # Support responses wire API structure in non-streaming
+                    if "response" in resp_json and isinstance(resp_json["response"], dict):
+                        resp_obj = resp_json["response"]
+                        if "model" in resp_obj: resp_model = resp_obj["model"]
+                        if "reasoning" in resp_obj and isinstance(resp_obj["reasoning"], dict):
+                            create_effort = str(resp_obj["reasoning"].get("effort") or "enabled")
+                            final_effort = create_effort
+                        if "usage" in resp_obj:
+                            resp_json["usage"] = resp_obj["usage"]
+
                     if "model" in resp_json: resp_model = resp_json["model"]
                     if "reasoning_effort" in resp_json:
                         create_effort = str(resp_json["reasoning_effort"])
                         final_effort = str(resp_json["reasoning_effort"])
                     if "usage" in resp_json:
                         u = resp_json["usage"]
+                        output_tokens = u.get("output_tokens", 0) or u.get("completion_tokens", 0)
+                        input_tokens = u.get("input_tokens", 0) or u.get("prompt_tokens", 0)
                         dtls = u.get("completion_tokens_details") or u.get("output_tokens_details") or {}
-                        rtoks = dtls.get("reasoning_tokens", 0) or u.get("thinking_tokens", 0) or 0
+                        rtoks = dtls.get("reasoning_tokens", 0) or dtls.get("thinking_tokens", 0) or u.get("thinking_tokens", 0) or u.get("reasoning_tokens", 0)
                         if rtoks:
                             reasoning_tokens = rtoks
                     if "usageMetadata" in resp_json:
                         g_toks = resp_json["usageMetadata"].get("thoughtsTokenCount") or 0
                         if g_toks:
                             reasoning_tokens = g_toks
+                        if "candidatesTokenCount" in resp_json["usageMetadata"] and not output_tokens:
+                            output_tokens = resp_json["usageMetadata"]["candidatesTokenCount"]
+                        if "promptTokenCount" in resp_json["usageMetadata"] and not input_tokens:
+                            input_tokens = resp_json["usageMetadata"]["promptTokenCount"]
                     if isinstance(resp_json.get("content"), list):
                         for blk in resp_json["content"]:
                             if isinstance(blk, dict) and blk.get("type") == "thinking":
                                 thinking_chars += len(blk.get("thinking") or "")
+                                if create_effort == "-":
+                                    create_effort = "thinking-on"
+                                    final_effort = "thinking-on"
+
+                    if reasoning_tokens == 0 and thinking_chars > 0:
+                        reasoning_tokens = max(1, round(thinking_chars / 3.5))
                 except Exception:
                     pass
 
@@ -877,6 +965,8 @@ class MonitorProxyHandler(BaseHTTPRequestHandler):
             "final_effort": final_effort,
             "reasoning_tokens": reasoning_tokens,
             "thinking_chars": thinking_chars,
+            "output_tokens": output_tokens,
+            "input_tokens": input_tokens,
             "path": self.path,
             "upstream": upstream_base,
             "duration_ms": duration_ms,
