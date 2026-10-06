@@ -8,6 +8,12 @@ A lightweight audit proxy designed specifically for **Claude Code** and **Codex*
 
 ---
 
+## 📸 Dashboard Preview
+
+![AI Reasoning Monitor Dashboard](assets/dashboard.png)
+
+---
+
 ## 🧐 What Does It Do?
 
 When routing through 3rd-party API relays, high reasoning effort requests are sometimes silently weakened. This tool runs on local port `5050` to inspect:
