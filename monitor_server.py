@@ -632,7 +632,12 @@ class MonitorProxyHandler(BaseHTTPRequestHandler):
         upstream_base = self.determine_upstream(self.path, tool_name)
         target_url = build_target_url(upstream_base, self.path)
 
-        headers = {k: v for k, v in self.headers.items() if k.lower() not in ["host", "content-length"]}
+        HOP_BY_HOP_HEADERS = {
+            "host", "content-length", "connection", "keep-alive",
+            "proxy-authenticate", "proxy-authorization", "te", "trailers",
+            "transfer-encoding", "upgrade"
+        }
+        headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP_BY_HOP_HEADERS}
         parsed_target = urlparse(target_url)
         headers["Host"] = parsed_target.netloc
 
@@ -652,14 +657,23 @@ class MonitorProxyHandler(BaseHTTPRequestHandler):
         resp_model = model_req
 
         try:
-            resp = requests.request(
-                method=method,
-                url=target_url,
-                headers=headers,
-                data=body_bytes,
-                stream=True,
-                timeout=180
-            )
+            resp = None
+            for attempt in range(2):
+                try:
+                    resp = requests.request(
+                        method=method,
+                        url=target_url,
+                        headers=headers,
+                        data=body_bytes,
+                        stream=True,
+                        timeout=180
+                    )
+                    break
+                except (requests.exceptions.ConnectionError, requests.exceptions.ChunkedEncodingError):
+                    if attempt == 0:
+                        time.sleep(0.3)
+                        continue
+                    raise
 
             # Check upstream headers for reasoning or model metadata
             for h_key, h_val in resp.headers.items():
@@ -675,7 +689,7 @@ class MonitorProxyHandler(BaseHTTPRequestHandler):
                 # Forward response headers for streaming SSE
                 self.send_response(resp.status_code)
                 for k, v in resp.headers.items():
-                    if k.lower() not in ["content-length", "transfer-encoding", "content-encoding"]:
+                    if k.lower() not in ["content-length", "transfer-encoding", "content-encoding", "connection"]:
                         self.send_header(k, v)
                 self.end_headers()
 
@@ -687,7 +701,7 @@ class MonitorProxyHandler(BaseHTTPRequestHandler):
                     try:
                         self.wfile.write(chunk)
                         self.wfile.flush()
-                    except (BrokenPipeError, ConnectionResetError):
+                    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                         break
 
                     # Inspect SSE chunk for reasoning effort & tokens
