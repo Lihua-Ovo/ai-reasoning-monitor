@@ -16,6 +16,8 @@ import json
 import time
 import queue
 import threading
+import sqlite3
+import re
 from datetime import datetime
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
@@ -31,6 +33,83 @@ except ImportError:
     HAS_RICH = False
     console = None
 
+# 路径常量 (cc-switch 与各客户端配置文件)
+CC_SWITCH_SETTINGS = os.path.expanduser(r"~\.cc-switch\settings.json")
+CC_SWITCH_DB = os.path.expanduser(r"~\.cc-switch\cc-switch.db")
+CLAUDE_DESKTOP_PROFILE = os.path.expanduser(r"~\AppData\Local\Claude-3p\configLibrary\00000000-0000-4000-8000-000000157210.json")
+
+# 缓存当前供应商信息 (TTL 2秒，防止高频 sqlite 查询)
+_PROVIDER_CACHE = {}
+_PROVIDER_CACHE_TIME = {}
+
+def get_ccswitch_provider_info(app_key="ClaudeDesktop", force_refresh=False):
+    """
+    实时/动态读取 cc-switch 中指定客户端当前的活动供应商配置
+    app_key 可选: 'ClaudeDesktop', 'Claude', 'Codex'
+    返回: (provider_name, base_url, auth_token)
+    """
+    now = time.time()
+    if not force_refresh and app_key in _PROVIDER_CACHE and (now - _PROVIDER_CACHE_TIME.get(app_key, 0) < 2):
+        return _PROVIDER_CACHE[app_key]
+
+    settings_key = f"currentProvider{app_key}"
+    provider_id = None
+    if os.path.exists(CC_SWITCH_SETTINGS):
+        try:
+            with open(CC_SWITCH_SETTINGS, "r", encoding="utf-8") as f:
+                st = json.load(f)
+                provider_id = st.get(settings_key)
+        except Exception:
+            pass
+
+    app_type_map = {
+        "ClaudeDesktop": "claude-desktop",
+        "Claude": "claude",
+        "Codex": "codex",
+    }
+    target_app_type = app_type_map.get(app_key, "claude-desktop")
+
+    p_name, base_url, token = None, None, None
+    if os.path.exists(CC_SWITCH_DB):
+        try:
+            conn = sqlite3.connect(f"file:{CC_SWITCH_DB}?mode=ro", uri=True)
+            cur = conn.cursor()
+            if provider_id:
+                cur.execute("SELECT name, settings_config FROM providers WHERE id = ?", (provider_id,))
+                row = cur.fetchone()
+            else:
+                cur.execute("SELECT name, settings_config FROM providers WHERE app_type = ? AND is_current = 1", (target_app_type,))
+                row = cur.fetchone()
+            conn.close()
+
+            if row:
+                p_name, cfg_str = row
+                cfg = json.loads(cfg_str)
+                env = cfg.get("env", {})
+                base_url = env.get("ANTHROPIC_BASE_URL") or cfg.get("baseUrl")
+                token = env.get("ANTHROPIC_AUTH_TOKEN") or cfg.get("apiKey")
+                if not base_url and "config" in cfg:
+                    m = re.search(r'base_url\s*=\s*["\']([^"\']+)["\']', cfg["config"])
+                    if m:
+                        base_url = m.group(1)
+                    auth = cfg.get("auth", {})
+                    token = auth.get("OPENAI_API_KEY")
+        except Exception:
+            pass
+
+    result = (p_name or "默认供应商", (base_url or "").rstrip("/"), token or "")
+    _PROVIDER_CACHE[app_key] = result
+    _PROVIDER_CACHE_TIME[app_key] = now
+    return result
+
+def build_target_url(upstream_base, req_path):
+    """构建安全转发 URL，自动避免 /v1/v1 路径重复问题"""
+    base = upstream_base.rstrip("/")
+    path = req_path
+    if base.endswith("/v1") and path.startswith("/v1/"):
+        base = base[:-3]
+    return f"{base}{path}"
+
 # 默认上游配置 (自动适配已运行的 cc-switch: 127.0.0.1:15721)
 DEFAULT_UPSTREAMS = {
     "openai": os.environ.get("UPSTREAM_OPENAI", "http://127.0.0.1:15721"),
@@ -42,6 +121,7 @@ LOGS_LOCK = threading.Lock()
 LOGS = []
 LOG_ID_COUNTER = 0
 SSE_SUBSCRIBERS = []
+
 
 BASE_DIR = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
 WEB_UI_PATH = os.path.join(BASE_DIR, "web_ui.html")
@@ -139,14 +219,27 @@ def print_rich_table(latest_entry=None):
 
 def detect_tool_name(headers, path, body):
     ua = headers.get("User-Agent", "").lower()
-    if "claude" in ua or "anthropic" in ua or "/messages" in path:
+    if "desktop" in ua or "claude.exe" in ua or "claude-3p" in ua:
+        return "Claude Desktop"
+    if "claude-code" in ua:
         return "Claude Code"
     if "antigravity" in ua or "gemini" in ua or "google" in ua:
         return "Antigravity IDE"
-    if "codex" in ua or "copilot" in ua or "openai" in ua:
+    if "codex" in ua or "copilot" in ua or "openai" in ua or "/responses" in path:
         return "Codex"
     if "cursor" in ua:
         return "Cursor"
+    if "/messages" in path:
+        # 检测请求特征或模型（例如 Claude Desktop 客户端特征）
+        if isinstance(body, dict):
+            m = str(body.get("model", "")).lower()
+            sys_prompt = str(body.get("system", ""))
+            if "fable" in m or "session titles" in sys_prompt:
+                return "Claude Desktop"
+        if "code" in ua:
+            return "Claude Code"
+        return "Claude Desktop"
+    return "AI-Client"
 def normalize_effort_score(effort_val):
     """
     量化评分对齐 5 档思考等级（完全基于服务端真实返回参数，不基于 Token 数量猜测）：
@@ -461,15 +554,19 @@ class MonitorProxyHandler(BaseHTTPRequestHandler):
             if 'q' in locals() and q in SSE_SUBSCRIBERS:
                 SSE_SUBSCRIBERS.remove(q)
 
-    def determine_upstream(self, path):
+    def determine_upstream(self, path, tool_name="AI-Client"):
         # 1. Custom header override
         custom_upstream = self.headers.get("X-Target-Upstream")
         if custom_upstream:
             return custom_upstream.rstrip("/")
 
-        # 2. Path-based routing
-        if "/messages" in path:
-            return DEFAULT_UPSTREAMS["anthropic"]
+        # 2. Tool-based / Path-based dynamic resolution
+        if tool_name == "Claude Desktop" or ("/messages" in path and "codex" not in tool_name.lower()):
+            # 自动读取 cc-switch 中 Claude Desktop 当前激活的真实供应商
+            p_name, base_url, _ = get_ccswitch_provider_info("ClaudeDesktop")
+            if base_url:
+                return base_url
+            return DEFAULT_UPSTREAMS.get("anthropic", "https://anyrouter.top")
         elif ":generateContent" in path or ":streamGenerateContent" in path:
             return DEFAULT_UPSTREAMS["gemini"]
         else:
@@ -487,13 +584,19 @@ class MonitorProxyHandler(BaseHTTPRequestHandler):
         model_req, req_effort, req_json = parse_request_payload(body_bytes, self.path)
         tool_name = detect_tool_name(self.headers, self.path, req_json)
 
-        # Prepare upstream request
-        upstream_base = self.determine_upstream(self.path)
-        target_url = f"{upstream_base}{self.path}"
+        # Prepare upstream request with dynamic resolution
+        upstream_base = self.determine_upstream(self.path, tool_name)
+        target_url = build_target_url(upstream_base, self.path)
 
         headers = {k: v for k, v in self.headers.items() if k.lower() not in ["host", "content-length"]}
         parsed_target = urlparse(target_url)
         headers["Host"] = parsed_target.netloc
+
+        # 对于 Claude Desktop，如果请求未带鉴权头，自动补全 cc-switch 当前供应商的 API Key
+        if tool_name == "Claude Desktop" and not headers.get("x-api-key") and not headers.get("authorization"):
+            _, _, p_token = get_ccswitch_provider_info("ClaudeDesktop")
+            if p_token:
+                headers["x-api-key"] = p_token
 
         create_effort = "-"
         final_effort = "-"
@@ -522,17 +625,16 @@ class MonitorProxyHandler(BaseHTTPRequestHandler):
                 if "openai-model" in k_lower or "model" in k_lower:
                     resp_model = h_val
 
-            # Forward response headers to client
-            self.send_response(resp.status_code)
-            for k, v in resp.headers.items():
-                if k.lower() not in ["content-length", "transfer-encoding", "content-encoding"]:
-                    self.send_header(k, v)
-            self.end_headers()
-
-            # Stream response body to client while inspecting chunks
             is_sse = "text/event-stream" in resp.headers.get("Content-Type", "")
 
             if is_sse:
+                # Forward response headers for streaming SSE
+                self.send_response(resp.status_code)
+                for k, v in resp.headers.items():
+                    if k.lower() not in ["content-length", "transfer-encoding", "content-encoding"]:
+                        self.send_header(k, v)
+                self.end_headers()
+
                 sse_buffer = ""
                 for chunk in resp.iter_content(chunk_size=512):
                     if not chunk:
@@ -629,16 +731,20 @@ class MonitorProxyHandler(BaseHTTPRequestHandler):
                     except Exception:
                         pass
             else:
-                # Non-streaming response
-                full_body = b""
-                for chunk in resp.iter_content(chunk_size=4096):
-                    if not chunk: continue
-                    full_body += chunk
-                    try:
-                        self.wfile.write(chunk)
-                        self.wfile.flush()
-                    except Exception:
-                        break
+                # Non-streaming response: read full body first to provide accurate Content-Length
+                full_body = resp.content
+                self.send_response(resp.status_code)
+                for k, v in resp.headers.items():
+                    if k.lower() not in ["content-length", "transfer-encoding", "content-encoding"]:
+                        self.send_header(k, v)
+                self.send_header("Content-Length", str(len(full_body)))
+                self.end_headers()
+
+                try:
+                    self.wfile.write(full_body)
+                    self.wfile.flush()
+                except Exception:
+                    pass
 
                 try:
                     resp_json = json.loads(full_body.decode("utf-8", errors="ignore"))
@@ -726,10 +832,24 @@ class MonitorProxyHandler(BaseHTTPRequestHandler):
         add_log_entry(log_item)
 
 
-def start_codex_config_auto_sync():
+def start_config_auto_sync():
+    """
+    全自动配置同步守护线程 (Codex & Claude Desktop)
+    1. Codex 守护：
+       检测 ~/.codex/config.toml，若检测到 cc-switch 重置为 127.0.0.1:15721/v1，
+       自动替换为 127.0.0.1:5050/v1，实现无感拦截。
+    2. Claude Desktop 守护：
+       检测 Claude Desktop 配置 profile (AppData/Local/Claude-3p/configLibrary/00000000-0000-4000-8000-000000157210.json)
+       当 cc-switch 切换供应商并向该文件写入真实远端地址时，
+       自动记录最新真实上游，并将 inferenceGatewayBaseUrl 维持重写为 http://127.0.0.1:5050，
+       保证 Claude Desktop 始终直连 5050 监控器，同时上游动态跟随后台切换，零手动操作！
+    """
     def _watcher():
         codex_toml = os.path.expanduser(r"~\.codex\config.toml")
+        claude_profile = CLAUDE_DESKTOP_PROFILE
+
         while True:
+            # 1. 自动同步 Codex
             try:
                 if os.path.exists(codex_toml):
                     with open(codex_toml, "r", encoding="utf-8", errors="ignore") as f:
@@ -738,12 +858,36 @@ def start_codex_config_auto_sync():
                         new_content = content.replace("127.0.0.1:15721/v1", "127.0.0.1:5050/v1")
                         with open(codex_toml, "w", encoding="utf-8") as f:
                             f.write(new_content)
+                        msg = "⚡ 自动守护生效：检测到 cc-switch 切换了 Codex 配置，已自动重定向至 5050 监控器！"
                         if HAS_RICH and console:
-                            console.print(f"[bold cyan]⚡ 自动守护生效：[/bold cyan]检测到 CCSwitch 切换了 Codex 配置，已自动重定向至 5050 监控器！")
+                            console.print(f"[bold cyan]{msg}[/bold cyan]")
                         else:
-                            print(f"[{datetime.now().strftime('%H:%M:%S')}] 自动守护：已自动将 Codex 端口重定向至 5050！")
+                            print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
             except Exception:
                 pass
+
+            # 2. 自动同步 Claude Desktop
+            try:
+                if os.path.exists(claude_profile):
+                    with open(claude_profile, "r", encoding="utf-8", errors="ignore") as f:
+                        p_data = json.load(f)
+                    cur_gw = (p_data.get("inferenceGatewayBaseUrl") or "").strip()
+                    if cur_gw and cur_gw.rstrip("/") != "http://127.0.0.1:5050":
+                        new_real_upstream = cur_gw.rstrip("/")
+                        p_data["inferenceGatewayBaseUrl"] = "http://127.0.0.1:5050"
+                        with open(claude_profile, "w", encoding="utf-8") as f:
+                            json.dump(p_data, f, indent=2, ensure_ascii=False)
+
+                        # 强制刷新缓存，获取当前供应商名称
+                        prov_name, _, _ = get_ccswitch_provider_info("ClaudeDesktop", force_refresh=True)
+                        msg = f"⚡ 自动守护生效：检测到 cc-switch 切换了 Claude Desktop 供应商 -> [{prov_name}] ({new_real_upstream})，已自动对接 5050 监控器！"
+                        if HAS_RICH and console:
+                            console.print(f"[bold cyan]{msg}[/bold cyan]")
+                        else:
+                            print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+            except Exception:
+                pass
+
             time.sleep(1)
 
     t = threading.Thread(target=_watcher, daemon=True)
@@ -754,15 +898,20 @@ class ThreadedHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = False
 
 def run_server(port=5050):
-    start_codex_config_auto_sync()
+    start_config_auto_sync()
     server = ThreadedHTTPServer(("0.0.0.0", port), MonitorProxyHandler)
+    cd_name, cd_url, _ = get_ccswitch_provider_info("ClaudeDesktop")
+    codex_name, codex_url, _ = get_ccswitch_provider_info("Codex")
+
     if HAS_RICH:
         console.print(f"[bold green]✓ AI 模型与思考等级监控服务已启动！[/bold green]")
         console.print(f"[cyan]• Web 仪表盘:[/cyan] [bold underline]http://127.0.0.1:{port}[/bold underline]")
         console.print(f"[cyan]• 代理监听端口:[/cyan] [bold]127.0.0.1:{port}[/bold]")
-        console.print(f"[dim]• 转发上游: OpenAI({DEFAULT_UPSTREAMS['openai']}), Claude({DEFAULT_UPSTREAMS['anthropic']})[/dim]\n")
+        console.print(f"[cyan]• 全自动守护状态:[/cyan] [bold green]Codex (已接管)[/bold green] | [bold green]Claude Desktop (已接管)[/bold green]")
+        console.print(f"[dim]• 动态上游解析: Codex -> 127.0.0.1:15721 [{codex_name}], Claude Desktop -> {cd_url or '默认'} [{cd_name}][/dim]\n")
     else:
         print(f"Server started on http://127.0.0.1:{port}")
+        print(f"Auto-sync active: Codex & Claude Desktop -> 127.0.0.1:{port}")
 
     print_rich_table()
 
@@ -776,3 +925,4 @@ def run_server(port=5050):
 if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 5050
     run_server(port)
+
