@@ -81,7 +81,6 @@ def print_rich_table(latest_entry=None):
     table.add_column("首包回显", width=9, justify="center")
     table.add_column("最终回显", width=9, justify="center")
     table.add_column("思考Tokens", width=11, justify="right")
-    table.add_column("预测等级", width=9, justify="center")
     table.add_column("状态判定", width=14)
 
     # Show last 10 entries in terminal
@@ -109,12 +108,32 @@ def print_rich_table(latest_entry=None):
             color_effort(item["create_effort"]),
             color_effort(item["final_effort"]),
             f"{item['reasoning_tokens']} tok" if item.get('reasoning_tokens') else "-",
-            color_effort(item.get("predicted_effort", "-")),
             status_text
         )
 
     console.clear()
     console.print(table)
+
+    stats_rows = compute_group_stats(limit=6)
+    if stats_rows:
+        st = Table(title="📊 档位思考消耗统计 (已过滤空回 · 仅统计不作判定)", show_header=True, header_style="bold cyan", title_justify="left")
+        st.add_column("模型", width=24, style="magenta")
+        st.add_column("生效档位", width=10, justify="center")
+        st.add_column("样本", width=6, justify="right")
+        st.add_column("平均", width=13, justify="right")
+        st.add_column("中位数", width=13, justify="right")
+        st.add_column("范围", width=19, justify="right")
+        for r in stats_rows:
+            st.add_row(
+                r["model"],
+                r["level"],
+                str(r["count"]),
+                f"{r['avg']:,.0f} {r['unit']}",
+                f"{r['median']:,.0f} {r['unit']}",
+                f"{r['min']:,.0f} ~ {r['max']:,.0f}",
+            )
+        console.print(st)
+
     console.print("[dim]Web 监控面板: [link=http://127.0.0.1:5050]http://127.0.0.1:5050[/link] | 按 Ctrl+C 停止[/dim]\n")
 
 
@@ -128,9 +147,9 @@ def detect_tool_name(headers, path, body):
         return "Codex"
     if "cursor" in ua:
         return "Cursor"
-def normalize_effort_score(effort_val, tokens=0):
+def normalize_effort_score(effort_val):
     """
-    量化评分对齐 5 档思考等级（完全基于服务端真实返回参数，不基于 Token 数量脑补）：
+    量化评分对齐 5 档思考等级（完全基于服务端真实返回参数，不基于 Token 数量猜测）：
     5档: xhigh, max, extreme, ultra, "5"
     4档: high, deep, "4"
     3档: medium, med, balanced, "3"
@@ -167,27 +186,49 @@ def normalize_effort_score(effort_val, tokens=0):
 
     return 0
 
-def estimate_predicted_effort(tokens):
-    """
-    基于 Artificial Analysis Intelligence Index v4.3 权威测试基准根据 Token 消耗估算推理档位：
-    - Low:    约 938 tok  (范围: 0 < tokens < 2000)
-    - Medium: 约 3k tok   (范围: 2000 <= tokens < 4000)
-    - High:   约 5k tok   (范围: 4000 <= tokens < 7000)
-    - XHigh:  约 9k tok   (范围: 7000 <= tokens < 13000)
-    - Max:    约 17k+ tok (范围: tokens >= 13000)
-    """
-    if not tokens or tokens <= 0:
-        return "-"
-    if tokens >= 13000:
-        return "Max"
-    elif tokens >= 7000:
-        return "XHigh"
-    elif tokens >= 4000:
-        return "High"
-    elif tokens >= 2000:
-        return "Medium"
-    else:
-        return "Low"
+LEVEL_LABELS = {5: "XHigh", 4: "High", 3: "Medium", 2: "Low", 1: "Minimal"}
+
+
+def effective_level_label(entry):
+    """生效档位：优先取服务端回显 (final -> create)，无回显时退回请求档位；无法识别时保留原始字符串。"""
+    for key in ("final_effort", "create_effort", "req_effort"):
+        raw = str(entry.get(key) or "-")
+        score = normalize_effort_score(raw)
+        if score > 0:
+            return LEVEL_LABELS[score]
+    raw = str(entry.get("req_effort") or "-")
+    return raw if raw != "-" else "未标注"
+
+
+def compute_group_stats(limit=None):
+    """按 (模型, 生效档位) 统计思考消耗；过滤空回。Token 数仅作统计参考，不用于等级判定。"""
+    groups = {}
+    with LOGS_LOCK:
+        items = list(LOGS)
+    for it in items:
+        toks = it.get("reasoning_tokens") or 0
+        chars = it.get("thinking_chars") or 0
+        if toks <= 0 and chars <= 0:
+            continue
+        key = (it.get("model") or "-", effective_level_label(it))
+        g = groups.setdefault(key, {"toks": [], "chars": []})
+        if toks > 0:
+            g["toks"].append(toks)
+        else:
+            g["chars"].append(chars)
+
+    rows = []
+    for (model, level), g in groups.items():
+        vals = sorted(g["toks"] or g["chars"])
+        unit = "tok" if g["toks"] else "字"
+        n = len(vals)
+        median = vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2
+        rows.append({
+            "model": model, "level": level, "unit": unit, "count": n,
+            "avg": sum(vals) / n, "median": median, "min": vals[0], "max": vals[-1],
+        })
+    rows.sort(key=lambda r: r["count"], reverse=True)
+    return rows[:limit] if limit else rows
 
 
 def parse_request_payload(body_bytes, path):
@@ -457,6 +498,7 @@ class MonitorProxyHandler(BaseHTTPRequestHandler):
         create_effort = "-"
         final_effort = "-"
         reasoning_tokens = 0
+        thinking_chars = 0
         create_echo_raw = {}
         final_echo_raw = {}
         first_chunk_inspected = False
@@ -550,6 +592,12 @@ class MonitorProxyHandler(BaseHTTPRequestHandler):
                                         if msg.get("thinking"):
                                             create_effort = "thinking-on"
 
+                                # Anthropic 流式思考内容累计：thinking_delta 字符数（统计实际思考量）
+                                if chunk_json.get("type") == "content_block_delta":
+                                    delta_obj = chunk_json.get("delta", {})
+                                    if isinstance(delta_obj, dict) and delta_obj.get("type") == "thinking_delta":
+                                        thinking_chars += len(delta_obj.get("thinking") or "")
+
                                 # 2. Last / Usage chunk (最终回显)
                                 if "usage" in chunk_json:
                                     final_echo_raw = chunk_json
@@ -567,6 +615,13 @@ class MonitorProxyHandler(BaseHTTPRequestHandler):
                                     
                                     if "reasoning_effort" in chunk_json:
                                         final_effort = str(chunk_json["reasoning_effort"])
+
+                                # Gemini 流式: usageMetadata.thoughtsTokenCount
+                                if "usageMetadata" in chunk_json:
+                                    final_echo_raw = chunk_json
+                                    g_toks = chunk_json["usageMetadata"].get("thoughtsTokenCount") or 0
+                                    if g_toks:
+                                        reasoning_tokens = g_toks
 
                                 if "model" in chunk_json:
                                     resp_model = chunk_json["model"]
@@ -593,8 +648,20 @@ class MonitorProxyHandler(BaseHTTPRequestHandler):
                     if "reasoning_effort" in resp_json:
                         create_effort = str(resp_json["reasoning_effort"])
                         final_effort = str(resp_json["reasoning_effort"])
-                    if "usage" in resp_json and "completion_tokens_details" in resp_json["usage"]:
-                        reasoning_tokens = resp_json["usage"]["completion_tokens_details"].get("reasoning_tokens", 0)
+                    if "usage" in resp_json:
+                        u = resp_json["usage"]
+                        dtls = u.get("completion_tokens_details") or u.get("output_tokens_details") or {}
+                        rtoks = dtls.get("reasoning_tokens", 0) or u.get("thinking_tokens", 0) or 0
+                        if rtoks:
+                            reasoning_tokens = rtoks
+                    if "usageMetadata" in resp_json:
+                        g_toks = resp_json["usageMetadata"].get("thoughtsTokenCount") or 0
+                        if g_toks:
+                            reasoning_tokens = g_toks
+                    if isinstance(resp_json.get("content"), list):
+                        for blk in resp_json["content"]:
+                            if isinstance(blk, dict) and blk.get("type") == "thinking":
+                                thinking_chars += len(blk.get("thinking") or "")
                 except Exception:
                     pass
 
@@ -610,24 +677,24 @@ class MonitorProxyHandler(BaseHTTPRequestHandler):
         is_downgraded = False
         alert_reasons = []
 
-        # 降级判定：仅在服务端明确返回了更低的思考等级，或请求思考但 0 token 思考失效时判定
+        # 降级判定：仅比对服务端回显的思考等级与请求等级（思考 Token 数是动态的，不作判定依据）
         req_score = normalize_effort_score(req_effort)
         create_score = normalize_effort_score(create_effort) if create_effort != "-" else req_score
         final_score = normalize_effort_score(final_effort) if final_effort != "-" else create_score
 
         if req_score > 0:
-            # 1. 首包明确回显了更低等级
-            if create_effort != "-" and create_score < req_score:
+            # 只比对「服务端回显等级」与「请求等级」；思考 Token 数是动态的，仅作统计，不参与判定
+            is_create_off = str(create_effort).lower().strip() in ["none", "off", "disabled", "false", "0"]
+            is_final_off = str(final_effort).lower().strip() in ["none", "off", "disabled", "false", "0"]
+
+            # 1. 首包明确回显了更低等级或关闭思考
+            if create_effort != "-" and (is_create_off or (0 < create_score < req_score)):
                 is_downgraded = True
                 alert_reasons.append(f"首包回显降级 ({req_effort} -> {create_effort})")
-            # 2. 尾包明确回显了更低等级
-            elif final_effort != "-" and final_score < req_score:
+            # 2. 尾包明确回显了更低等级或关闭思考
+            elif final_effort != "-" and (is_final_off or (0 < final_score < req_score)):
                 is_downgraded = True
                 alert_reasons.append(f"最终回显降级 ({req_effort} -> {final_effort})")
-            # 3. 请求了思考，但最终未产生任何思考 Token 且无回显确认（思考被剥夺）
-            elif reasoning_tokens == 0 and create_effort in ["-", "none", "off", "0"] and final_effort in ["-", "none", "off", "0"]:
-                is_downgraded = True
-                alert_reasons.append(f"未产生思考Token ({req_effort} 思考失效)")
 
         # 2. Check model substitution (e.g. requested gpt-6-astra or sonnet-3-7, got 4o-mini)
         if model_req != "-" and resp_model != "-" and model_req.lower() not in resp_model.lower():
@@ -645,7 +712,7 @@ class MonitorProxyHandler(BaseHTTPRequestHandler):
             "create_effort": create_effort,
             "final_effort": final_effort,
             "reasoning_tokens": reasoning_tokens,
-            "predicted_effort": estimate_predicted_effort(reasoning_tokens),
+            "thinking_chars": thinking_chars,
             "path": self.path,
             "upstream": upstream_base,
             "duration_ms": duration_ms,

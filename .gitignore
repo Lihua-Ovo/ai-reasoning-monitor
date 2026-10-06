@@ -42,3 +42,9 @@ local_config.json
 test_client.py
 mitm_addon.py
 push_to_github.bat
+
+# Local audit dumps & scratch files
+monitor_audit_logs.json
+audit_evidence_*.json
+scratch_profile/
+

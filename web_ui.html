@@ -1047,6 +1047,27 @@
     </div>
   </div>
 
+  <!-- 档位思考消耗统计 (仅统计，不参与等级判定) -->
+  <div class="table-floating-card" id="statsCard" style="display:none; margin-bottom:18px;">
+    <div style="display:flex; align-items:baseline; gap:10px; padding:14px 18px 4px;">
+      <span style="font-weight:600; font-size:13px;">档位思考消耗统计</span>
+      <span style="font-size:11px; color:var(--text-secondary);">按 模型 × 生效档位 分组 · 已过滤空回 · 仅供参考，不代表等级</span>
+    </div>
+    <table class="ios-table">
+      <thead>
+        <tr>
+          <th>模型</th>
+          <th style="width:95px;">生效档位</th>
+          <th style="width:70px;">样本</th>
+          <th style="width:115px;">平均</th>
+          <th style="width:115px;">中位数</th>
+          <th style="width:150px;">范围</th>
+        </tr>
+      </thead>
+      <tbody id="statsTableBody"></tbody>
+    </table>
+  </div>
+
   <!-- 悬浮大圆角数据卡 (Floating Rounded Table Card) -->
   <div class="table-floating-card">
     <table class="ios-table">
@@ -1059,13 +1080,12 @@
           <th style="width:95px;">首包回显</th>
           <th style="width:95px;">最终回显</th>
           <th style="width:115px;">思考 Tokens</th>
-          <th style="width:100px;">预测等级</th>
           <th style="width:120px;">审计结果</th>
         </tr>
       </thead>
       <tbody id="logTableBody">
         <tr>
-          <td colspan="9">
+          <td colspan="8">
             <div class="empty-state-box">
               <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" style="margin:0 auto 10px; display:block;">
                 <circle cx="12" cy="12" r="10"></circle>
@@ -1141,16 +1161,6 @@
     renderTable();
   }
 
-  // 基于 Artificial Analysis Intelligence Index v4.3 权威跑分基准根据推理 Token 消耗预估档位
-  function estimatePredictedEffort(tokens) {
-    if (!tokens || tokens <= 0) return '-';
-    if (tokens >= 13000) return 'Max';
-    if (tokens >= 7000)  return 'XHigh';
-    if (tokens >= 4000)  return 'High';
-    if (tokens >= 2000)  return 'Medium';
-    return 'Low';
-  }
-
   function formatBadge(level) {
     if (!level || level === '-' || level === 'none' || level === 'off' || level === '0') {
       return `<span class="pill pill-none">-</span>`;
@@ -1162,6 +1172,76 @@
     if (l.includes('low') || l.includes('minimal') || l.includes('min') || l === '2') return `<span class="pill pill-low">${level}</span>`;
     if (l === '1' || l.includes('lowest')) return `<span class="pill pill-low">${level}</span>`;
     return `<span class="pill pill-none">${level}</span>`;
+  }
+
+  const LEVEL_LABELS = { 5: 'XHigh', 4: 'High', 3: 'Medium', 2: 'Low', 1: 'Minimal' };
+
+  function effortScore(v) {
+    if (v === null || v === undefined) return 0;
+    const s = String(v).toLowerCase().trim();
+    if (!s || ['-', 'none', 'off', 'disabled', 'false', '0'].includes(s)) return 0;
+    if (['5', 'xhigh', 'max', 'extreme', 'extra-high', 'extra_high', 'ultra'].includes(s)) return 5;
+    if (['4', 'high', 'deep'].includes(s)) return 4;
+    if (['3', 'medium', 'med', 'balanced'].includes(s)) return 3;
+    if (['2', 'low'].includes(s)) return 2;
+    if (['1', 'minimal', 'min', 'very-low', 'lowest'].includes(s)) return 1;
+    if (s.includes('xhigh') || s.includes('max') || s.includes('extreme') || s.includes('ultra')) return 5;
+    if (s.includes('high') || s.includes('deep')) return 4;
+    if (s.includes('medium') || s.includes('med') || s.includes('balanced')) return 3;
+    if (s.includes('low')) return 2;
+    if (s.includes('min')) return 1;
+    return 0;
+  }
+
+  function effectiveLevelLabel(item) {
+    for (const key of ['final_effort', 'create_effort', 'req_effort']) {
+      const raw = String(item[key] || '-');
+      const sc = effortScore(raw);
+      if (sc > 0) return LEVEL_LABELS[sc];
+    }
+    const raw = String(item.req_effort || '-');
+    return raw !== '-' ? raw : '未标注';
+  }
+
+  // 档位思考消耗统计：按 (模型, 生效档位) 分组，过滤空回；仅统计，不参与等级判定
+  function renderStats(items) {
+    const groups = new Map();
+    items.forEach(it => {
+      const toks = it.reasoning_tokens || 0;
+      const chars = it.thinking_chars || 0;
+      if (toks <= 0 && chars <= 0) return;
+      const level = effectiveLevelLabel(it);
+      const key = (it.model || '-') + '||' + level;
+      if (!groups.has(key)) groups.set(key, { model: it.model || '-', level, toks: [], chars: [] });
+      const g = groups.get(key);
+      if (toks > 0) g.toks.push(toks);
+      else g.chars.push(chars);
+    });
+
+    const rows = [];
+    groups.forEach(g => {
+      const vals = (g.toks.length ? g.toks : g.chars).slice().sort((a, b) => a - b);
+      const unit = g.toks.length ? 'tok' : '字';
+      const n = vals.length;
+      const avg = vals.reduce((a, b) => a + b, 0) / n;
+      const median = n % 2 ? vals[(n - 1) / 2] : (vals[n / 2 - 1] + vals[n / 2]) / 2;
+      rows.push({ model: g.model, level: g.level, unit, n, avg, median, min: vals[0], max: vals[n - 1] });
+    });
+    rows.sort((a, b) => b.n - a.n);
+
+    const card = document.getElementById('statsCard');
+    const body = document.getElementById('statsTableBody');
+    if (!rows.length) { card.style.display = 'none'; return; }
+    card.style.display = '';
+    body.innerHTML = rows.map(r => `
+      <tr>
+        <td><code style="font-family:var(--font-mono); font-weight:600; font-size:12px;">${r.model}</code></td>
+        <td>${formatBadge(r.level)}</td>
+        <td style="font-family:var(--font-mono); font-size:11.5px;">${r.n}</td>
+        <td style="font-family:var(--font-mono); font-size:11.5px;">${Math.round(r.avg).toLocaleString()} ${r.unit}</td>
+        <td style="font-family:var(--font-mono); font-size:11.5px;">${Math.round(r.median).toLocaleString()} ${r.unit}</td>
+        <td style="font-family:var(--font-mono); font-size:11.5px; color:var(--text-secondary);">${r.min.toLocaleString()} ~ ${r.max.toLocaleString()}</td>
+      </tr>`).join('');
   }
 
   function renderTable() {
@@ -1182,10 +1262,12 @@
       );
     });
 
+    renderStats(filtered);
+
     if (filtered.length === 0) {
       tbody.innerHTML = `
         <tr>
-          <td colspan="9">
+          <td colspan="8">
             <div class="empty-state-box">
               <p>暂无符合筛选条件的记录</p>
             </div>
@@ -1202,7 +1284,9 @@
         : `<span class="status-capsule-badge ok">✓ 正常匹配</span>`;
 
       const clientDotClass = (item.tool && item.tool.includes('Codex')) ? 'codex' : ((item.tool && item.tool.includes('Claude')) ? 'claude' : '');
-      const predEffort = item.predicted_effort || estimatePredictedEffort(item.reasoning_tokens);
+      const thinkingCell = item.reasoning_tokens
+        ? item.reasoning_tokens.toLocaleString() + ' tok'
+        : (item.thinking_chars ? item.thinking_chars.toLocaleString() + ' 字' : '-');
 
       return `
         <tr ${rowClass} onclick="showDetail(${item.id})">
@@ -1217,8 +1301,7 @@
           <td>${formatBadge(item.req_effort)}</td>
           <td>${formatBadge(item.create_effort)}</td>
           <td>${formatBadge(item.final_effort)}</td>
-          <td><span style="font-family:var(--font-mono); font-size:11.5px; color:var(--text-secondary);">${item.reasoning_tokens ? item.reasoning_tokens.toLocaleString() + ' tok' : '-'}</span></td>
-          <td>${formatBadge(predEffort)}</td>
+          <td><span style="font-family:var(--font-mono); font-size:11.5px; color:var(--text-secondary);">${thinkingCell}</span></td>
           <td>${statusHtml}</td>
         </tr>
       `;
@@ -1267,8 +1350,8 @@
           <span class="v">${item.duration_ms || '-'} ms</span>
         </div>
         <div class="meta-row">
-          <span class="k">AA基准预测等级</span>
-          <span class="v">${formatBadge(item.predicted_effort || estimatePredictedEffort(item.reasoning_tokens))} (${item.reasoning_tokens ? item.reasoning_tokens.toLocaleString() + ' tok' : '0 tok'})</span>
+          <span class="k">思考消耗 (本次)</span>
+          <span class="v">${item.reasoning_tokens ? item.reasoning_tokens.toLocaleString() + ' tok (usage)' : (item.thinking_chars ? item.thinking_chars.toLocaleString() + ' 字 (thinking_delta 累计)' : '未采集到')}</span>
         </div>
         <div class="meta-row">
           <span class="k">思考等级判定</span>
@@ -1310,10 +1393,9 @@
 
   function exportCSV() {
     if (logs.length === 0) return alert('暂无审计数据可导出');
-    let csv = "时间,来源工具,模型,出站等级,首包回显,最终回显,思考Tokens,预测等级,状态\n";
+    let csv = "时间,来源工具,模型,出站等级,首包回显,最终回显,思考Tokens,思考字符,状态\n";
     logs.forEach(x => {
-      const pred = x.predicted_effort || estimatePredictedEffort(x.reasoning_tokens);
-      csv += `"${x.time}","${x.tool}","${x.model}","${x.req_effort}","${x.create_effort}","${x.final_effort}","${x.reasoning_tokens || ''}","${pred}","${x.is_downgraded ? '降级' : '正常'}"\n`;
+      csv += `"${x.time}","${x.tool}","${x.model}","${x.req_effort}","${x.create_effort}","${x.final_effort}","${x.reasoning_tokens || ''}","${x.thinking_chars || ''}","${x.is_downgraded ? '降级' : '正常'}"\n`;
     });
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
